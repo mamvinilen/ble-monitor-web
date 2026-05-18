@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>生理参数监测</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; padding: 10px; background: #f0f4f8; color: #333; }
+  .container { max-width: 600px; margin: auto; }
+  .led-container { text-align: center; margin-bottom: 20px; }
+  .led { width: 100px; height: 100px; border-radius: 50%; display: inline-block; margin-bottom: 10px; background: grey; transition: background 0.5s, box-shadow 0.5s; box-shadow: 0 0 10px rgba(0,0,0,0.2); }
+  .status-text { font-weight: bold; font-size: 20px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-bottom: 20px; }
+  button { flex: 1 1 45%; padding: 10px; border: none; border-radius: 8px; background: #007bff; color: white; font-size: 16px; cursor: pointer; }
+  button:hover { background: #0056b3; }
+  .card { background: white; border-radius: 12px; padding: 15px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+  .card h3 { margin-top: 0; }
+  .progress-bar { width: 100%; height: 20px; background: #e0e0e0; border-radius: 10px; overflow: hidden; margin: 10px 0; }
+  .progress { height: 100%; width: 0; background: linear-gradient(90deg, #00ff00, #ffff00, #ff0000); transition: width 0.3s; }
+  .hex-data { font-size: 12px; color: #666; }
+  canvas { width: 100% !important; height: 150px !important; }
+  .log { max-height: 200px; overflow-y: auto; background: #eef2f7; padding: 10px; border-radius: 8px; font-size: 12px; }
+  .alarm { box-shadow: 0 0 30px red, 0 0 60px red inset; animation: pulse 1s infinite alternate; }
+  @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="led-container">
+    <div class="led" id="led"></div>
+    <div class="status-text" id="led-status">状态: 正常</div>
+  </div>
+
+  <div class="buttons">
+    <button id="scan-btn">扫描连接</button>
+    <button id="disconnect-btn">断开</button>
+    <button id="demo-btn">演示模式</button>
+    <button id="clear-log-btn">清空日志</button>
+  </div>
+
+  <div class="card" id="param1-card">
+    <h3>温度 (℃)</h3>
+    <div class="progress-bar"><div class="progress" id="param1-bar"></div></div>
+    <div>当前值: <span id="param1-value">--</span> ℃</div>
+    <div class="hex-data">原始数据: <span id="param1-hex">--</span></div>
+    <canvas id="param1-chart"></canvas>
+  </div>
+
+  <div class="card" id="param2-card">
+    <h3>组织氧合 (%)</h3>
+    <div class="progress-bar"><div class="progress" id="param2-bar"></div></div>
+    <div>当前值: <span id="param2-value">--</span> %</div>
+    <div class="hex-data">原始数据: <span id="param2-hex">--</span></div>
+    <canvas id="param2-chart"></canvas>
+  </div>
+
+  <div class="card" id="param3-card">
+    <h3>灌注指数</h3>
+    <div class="progress-bar"><div class="progress" id="param3-bar"></div></div>
+    <div>当前值: <span id="param3-value">--</span></div>
+    <div class="hex-data">原始数据: <span id="param3-hex">--</span></div>
+    <canvas id="param3-chart"></canvas>
+  </div>
+
+  <div class="card">
+    <h3>通讯日志</h3>
+    <div class="log" id="log"></div>
+  </div>
+
+  <audio id="alarm-sound">
+    <source src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=" type="audio/wav">
+  </audio>
+</div>
+
+<script>
+const led = document.getElementById('led');
+const ledStatus = document.getElementById('led-status');
+const logEl = document.getElementById('log');
+const alarmSound = document.getElementById('alarm-sound');
+const paramElements = [
+  {value: document.getElementById('param1-value'), hex: document.getElementById('param1-hex'), bar: document.getElementById('param1-bar')},
+  {value: document.getElementById('param2-value'), hex: document.getElementById('param2-hex'), bar: document.getElementById('param2-bar')},
+  {value: document.getElementById('param3-value'), hex: document.getElementById('param3-hex'), bar: document.getElementById('param3-bar')}
+];
+
+const charts = [];
+['param1-chart','param2-chart','param3-chart'].forEach((id,index)=>{
+  const ctx = document.getElementById(id).getContext('2d');
+  charts[index] = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: '', data: [], borderColor: '#007bff', fill: false }] },
+    options: { animation: false, responsive:true, plugins:{legend:{display:false}}, scales:{x:{display:true},y:{beginAtZero:true}} }
+  });
+});
+
+function toHex(value) { return '0x' + Number(value*100).toString(16).toUpperCase(); }
+
+let demoMode = false;
+let interval;
+let device, server, characteristic;
+
+function log(msg){ const time = new Date().toLocaleTimeString(); logEl.innerHTML += `[${time}] ${msg}<br>`; logEl.scrollTop = logEl.scrollHeight; }
+
+function updateUI(values) {
+  values.forEach((v,i)=>{
+    paramElements[i].value.textContent = v;
+    paramElements[i].hex.textContent = toHex(v);
+    let percent = 0;
+    if(i===0) percent = (v-36)/(38.5-36)*100;
+    if(i===1) percent = v;
+    if(i===2) percent = v/2*100;
+    paramElements[i].bar.style.width = percent + '%';
+
+    const chart = charts[i];
+    if(chart.data.labels.length>=20){ chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
+    chart.data.labels.push(new Date().toLocaleTimeString());
+    chart.data.datasets[0].data.push(v);
+    chart.update();
+  });
+
+  const oxy = values[1];
+  const perf = values[2]/2*100;
+  let ledColor='green', statusText='正常';
+  if(oxy>33.3 || perf>33.3){ ledColor='yellow'; statusText='注意'; }
+  if(oxy>66.8 || perf>66.8){ ledColor='red'; statusText='警告'; }
+
+  led.style.background = ledColor;
+  led.classList.toggle('alarm', ledColor==='yellow' || ledColor==='red');
+  ledStatus.textContent = '状态: ' + statusText;
+  if(ledColor==='yellow' || ledColor==='red'){ alarmSound.play(); }
+}
+
+function generateDemoData() { return [ +(36 + Math.random() * 2.5).toFixed(1), +(85 + Math.random() * 15).toFixed(0), +(0.2 + Math.random() * 1.3).toFixed(2) ]; }
+
+function startDemo() { demoMode=true; clearInterval(interval); interval = setInterval(()=>{ const data = generateDemoData(); updateUI(data); log('演示数据更新: ' + data.join(', ')); }, 10000); }
+function stopDemo() { demoMode=false; clearInterval(interval); log('演示模式停止'); }
+
+async function connectBluetooth() {
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: ['0000fff0-0000-1000-8000-00805f9b34fb'] }] });
+    server = await device.gatt.connect();
+    const service = await server.getPrimaryService('0000fff0-0000-1000-8000-00805f9b34fb');
+    characteristic = await service.getCharacteristic('0000fff1-0000-1000-8000-00805f9b34fb');
+    await characteristic.startNotifications();
+    characteristic.addEventListener('characteristicvaluechanged', handleData);
+    log('蓝牙已连接: ' + device.name);
+    stopDemo();
+  } catch(err){ log('蓝牙连接失败: ' + err); }
+}
+
+function handleData(event){
+  const value = event.target.value;
+  const temp = value.getUint8(0);
+  const oxy = value.getUint8(1);
+  const perf = value.getFloat32(2,true);
+  updateUI([temp,oxy,perf]);
+  log('接收到数据: ' + [temp,oxy,perf].join(', '));
+}
+
+function disconnectBluetooth(){ if(device && device.gatt.connected){ device.gatt.disconnect(); log('蓝牙已断开'); } }
+
+document.getElementById('demo-btn').addEventListener('click', ()=>{ startDemo(); log('演示模式启动'); });
+document.getElementById('clear-log-btn').addEventListener('click', ()=>{ logEl.innerHTML=''; });
+document.getElementById('scan-btn').addEventListener('click', connectBluetooth);
+document.getElementById('disconnect-btn').addEventListener('click', disconnectBluetooth);
+
+startDemo();
+</script>
+</body>
+</html>
